@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
@@ -675,10 +676,35 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
+// requireAuth gates a handler behind a static bearer token, checked in
+// constant time. This REST API binds to all interfaces (see serverAddr
+// below) so it's reachable from other devices on the LAN - e.g. the drying
+// room's alert display - which means it also has zero protection against
+// anyone else on that network without this check.
+func requireAuth(token string, next http.HandlerFunc) http.HandlerFunc {
+	expected := []byte("Bearer " + token)
+	return func(w http.ResponseWriter, r *http.Request) {
+		got := []byte(r.Header.Get("Authorization"))
+		if len(got) != len(expected) || subtle.ConstantTimeCompare(got, expected) != 1 {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
+}
+
 // Start a REST API server to expose the WhatsApp client functionality
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	apiToken := os.Getenv("BRIDGE_API_TOKEN")
+	if apiToken == "" {
+		fmt.Println("BRIDGE_API_TOKEN is not set - refusing to start the REST API server.")
+		fmt.Println("This server binds to all network interfaces with no other access control.")
+		fmt.Println("Set BRIDGE_API_TOKEN (see deploy/run-bridge.sh) and restart.")
+		return
+	}
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/send", requireAuth(apiToken, func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -721,10 +747,10 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Success: success,
 			Message: message,
 		})
-	})
+	}))
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	http.HandleFunc("/api/download", requireAuth(apiToken, func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -772,7 +798,106 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			Filename: filename,
 			Path:     path,
 		})
-	})
+	}))
+
+	// Handler for on-demand history sync
+	// POST /api/history { chat_jid, batches?, count?, wait_ms?, poll_ms? }
+	// - count:   msgs per batch (default 50; whatsmeow's recommendation)
+	// - batches: max number of batches to send (default 1)
+	// - wait_ms: max time to wait for the async HistorySync response to land
+	//            (i.e. for the oldest stored msg to advance) before declaring
+	//            a stall. Default 90000 (90s).
+	// - poll_ms: how often to poll the DB while waiting. Default 2000.
+	// Stops early after 2 consecutive stalls (server has no older msgs).
+	http.HandleFunc("/api/history", requireAuth(apiToken, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			ChatJID string `json:"chat_jid"`
+			Count   int    `json:"count"`
+			Batches int    `json:"batches"`
+			WaitMs  int    `json:"wait_ms"`
+			PollMs  int    `json:"poll_ms"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid request format", http.StatusBadRequest)
+			return
+		}
+		if req.ChatJID == "" {
+			http.Error(w, "chat_jid is required", http.StatusBadRequest)
+			return
+		}
+		if req.Count <= 0 {
+			req.Count = 50
+		}
+		if req.Batches <= 0 {
+			req.Batches = 1
+		}
+		if req.WaitMs <= 0 {
+			req.WaitMs = 90000
+		}
+		if req.PollMs <= 0 {
+			req.PollMs = 2000
+		}
+
+		type batchResult struct {
+			Batch    int       `json:"batch"`
+			AnchorID string    `json:"anchor_id"`
+			AnchorTS time.Time `json:"anchor_ts"`
+			Error    string    `json:"error,omitempty"`
+			Stalled  bool      `json:"stalled,omitempty"`
+		}
+		results := make([]batchResult, 0, req.Batches)
+		stalls := 0
+		for i := 1; i <= req.Batches; i++ {
+			anchorID, anchorTS, err := requestOnDemandHistory(client, messageStore, req.ChatJID, req.Count)
+			res := batchResult{Batch: i, AnchorID: anchorID, AnchorTS: anchorTS}
+			if err != nil {
+				res.Error = err.Error()
+				results = append(results, res)
+				break
+			}
+			results = append(results, res)
+
+			if i == req.Batches {
+				break
+			}
+
+			// Wait until the oldest stored msg advances past anchorID, or
+			// timeout. The async events.HistorySync ON_DEMAND handler will
+			// insert older rows in the meantime.
+			deadline := time.Now().Add(time.Duration(req.WaitMs) * time.Millisecond)
+			advanced := false
+			for time.Now().Before(deadline) {
+				time.Sleep(time.Duration(req.PollMs) * time.Millisecond)
+				var newID string
+				if err := messageStore.db.QueryRow(
+					`SELECT id FROM messages WHERE chat_jid=? ORDER BY timestamp ASC LIMIT 1`,
+					req.ChatJID,
+				).Scan(&newID); err == nil && newID != anchorID {
+					advanced = true
+					break
+				}
+			}
+			if !advanced {
+				stalls++
+				results[len(results)-1].Stalled = true
+				if stalls >= 2 {
+					break
+				}
+			} else {
+				stalls = 0
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"chat_jid": req.ChatJID,
+			"results":  results,
+		})
+	}))
 
 	// Start the server
 	serverAddr := fmt.Sprintf(":%d", port)
@@ -1147,40 +1272,64 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 	fmt.Printf("History sync complete. Stored %d messages.\n", syncedCount)
 }
 
-// Request history sync from the server
-func requestHistorySync(client *whatsmeow.Client) {
-	if client == nil {
-		fmt.Println("Client is not initialized. Cannot request history sync.")
-		return
+// requestOnDemandHistory asks the user's primary device for `count` messages
+// older than the oldest message currently stored for chatJID. The response
+// arrives asynchronously as an events.HistorySync with type ON_DEMAND and is
+// persisted by handleHistorySync.
+//
+// Returns the oldest stored (id, timestamp) used as the anchor, so callers
+// can detect whether subsequent batches actually advanced the cursor.
+func requestOnDemandHistory(client *whatsmeow.Client, store *MessageStore, chatJID string, count int) (string, time.Time, error) {
+	if client == nil || !client.IsConnected() || client.Store.ID == nil {
+		return "", time.Time{}, fmt.Errorf("client not connected/logged in")
 	}
 
-	if !client.IsConnected() {
-		fmt.Println("Client is not connected. Please ensure you are connected to WhatsApp first.")
-		return
-	}
-
-	if client.Store.ID == nil {
-		fmt.Println("Client is not logged in. Please scan the QR code first.")
-		return
-	}
-
-	// Build and send a history sync request
-	historyMsg := client.BuildHistorySyncRequest(nil, 100)
-	if historyMsg == nil {
-		fmt.Println("Failed to build history sync request.")
-		return
-	}
-
-	_, err := client.SendMessage(context.Background(), types.JID{
-		Server: "s.whatsapp.net",
-		User:   "status",
-	}, historyMsg)
-
+	parsedChat, err := types.ParseJID(chatJID)
 	if err != nil {
-		fmt.Printf("Failed to request history sync: %v\n", err)
-	} else {
-		fmt.Println("History sync requested. Waiting for server response...")
+		return "", time.Time{}, fmt.Errorf("invalid chat_jid: %v", err)
 	}
+
+	var (
+		oldestID       string
+		oldestSender   string
+		oldestTime     time.Time
+		oldestIsFromMe bool
+	)
+	err = store.db.QueryRow(`
+		SELECT id, sender, timestamp, is_from_me
+		FROM messages
+		WHERE chat_jid = ?
+		ORDER BY timestamp ASC
+		LIMIT 1
+	`, chatJID).Scan(&oldestID, &oldestSender, &oldestTime, &oldestIsFromMe)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("no stored messages for chat %s: %v", chatJID, err)
+	}
+
+	senderJID, _ := types.ParseJID(oldestSender)
+	info := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     parsedChat,
+			Sender:   senderJID,
+			IsFromMe: oldestIsFromMe,
+			IsGroup:  parsedChat.Server == types.GroupServer,
+		},
+		ID:        oldestID,
+		Timestamp: oldestTime,
+	}
+
+	historyMsg := client.BuildHistorySyncRequest(info, count)
+	if historyMsg == nil {
+		return oldestID, oldestTime, fmt.Errorf("failed to build history sync request")
+	}
+
+	if _, err := client.SendPeerMessage(context.Background(), historyMsg); err != nil {
+		return oldestID, oldestTime, fmt.Errorf("failed to send history sync request: %v", err)
+	}
+
+	fmt.Printf("Requested %d historical msgs for %s anchored on %s @ %s\n",
+		count, chatJID, oldestID, oldestTime.Format(time.RFC3339))
+	return oldestID, oldestTime, nil
 }
 
 // analyzeOggOpus tries to extract duration and generate a simple waveform from an Ogg Opus file

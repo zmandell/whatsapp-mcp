@@ -1,3 +1,7 @@
 *.db
 claude_desktop_config.json
 whatsapp.log
+deploy/bearer.token
+deploy/bridge-api.token
+deploy/Caddyfile
+deploy/path.secret
