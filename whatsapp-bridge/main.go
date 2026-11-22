@@ -108,6 +108,23 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	return err
 }
 
+// TouchChat bumps a chat's last_message_time without overwriting an existing
+// name (StoreChat would), creating the chat with a placeholder name if absent.
+func (store *MessageStore) TouchChat(jid, fallbackName string, lastMessageTime time.Time) error {
+	res, err := store.db.Exec("UPDATE chats SET last_message_time = ? WHERE jid = ?", lastMessageTime, jid)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return nil
+	}
+	_, err = store.db.Exec(
+		"INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
+		jid, fallbackName, lastMessageTime,
+	)
+	return err
+}
+
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
 	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64) error {
@@ -204,7 +221,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -231,6 +248,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	msg := &waProto.Message{}
+
+	// Media details recorded with the sent message so download_media works on it.
+	var sentMediaType, sentFilename, sentURL string
+	var sentMediaKey, sentFileSHA256, sentFileEncSHA256 []byte
+	var sentFileLength uint64
 
 	// Check if we have media to send
 	if mediaPath != "" {
@@ -290,6 +312,23 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		}
 
 		fmt.Println("Media uploaded", resp)
+
+		switch mediaType {
+		case whatsmeow.MediaImage:
+			sentMediaType = "image"
+		case whatsmeow.MediaAudio:
+			sentMediaType = "audio"
+		case whatsmeow.MediaVideo:
+			sentMediaType = "video"
+		default:
+			sentMediaType = "document"
+		}
+		sentFilename = filepath.Base(mediaPath)
+		sentURL = resp.URL
+		sentMediaKey = resp.MediaKey
+		sentFileSHA256 = resp.FileSHA256
+		sentFileEncSHA256 = resp.FileEncSHA256
+		sentFileLength = resp.FileLength
 
 		// Create the appropriate message type based on media type
 		switch mediaType {
@@ -363,10 +402,33 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// WhatsApp never echoes a message back to the device that sent it, so record
+	// it here. Direct chats are keyed by LID in the store (that's what incoming
+	// events use), so resolve the phone number to keep replies in the same chat.
+	chatJID := recipientJID
+	if recipientJID.Server == types.DefaultUserServer {
+		if lid, lerr := client.Store.LIDs.GetLIDForPN(context.Background(), recipientJID); lerr == nil && !lid.IsEmpty() {
+			chatJID = lid
+		}
+	}
+	senderUser := ""
+	if client.Store.ID != nil {
+		senderUser = client.Store.ID.User
+	}
+	if serr := messageStore.TouchChat(chatJID.String(), chatJID.User, sendResp.Timestamp); serr != nil {
+		fmt.Printf("Warning: sent message but failed to update chat: %v\n", serr)
+	}
+	if serr := messageStore.StoreMessage(
+		sendResp.ID, chatJID.String(), senderUser, message, sendResp.Timestamp, true,
+		sentMediaType, sentFilename, sentURL, sentMediaKey, sentFileSHA256, sentFileEncSHA256, sentFileLength,
+	); serr != nil {
+		fmt.Printf("Warning: sent message but failed to store it: %v\n", serr)
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -732,7 +794,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
