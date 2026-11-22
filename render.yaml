@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: mcp-hub
+    runtime: docker
+    dockerfilePath: ./render/Dockerfile
+    dockerContext: .
+    plan: starter
+    region: virginia
+    numInstances: 1
+    healthCheckPath: /healthz
+    autoDeployTrigger: "off"
+    disk:
+      name: data
+      mountPath: /data
+      sizeGB: 1
+    envVars:
+      - key: WHATSAPP_HOST
+        value: whatsapp.spoonur.com
+      - key: MONARCH_HOST
+        value: monarch.spoonur.com
+      - key: MONARCH_MCP_READ_ONLY
+        value: "1"
+      - key: WHATSAPP_BEARER_TOKEN
+        sync: false
+      - key: WHATSAPP_PATH_SECRET
+        sync: false
+      - key: MONARCH_BEARER_TOKEN
+        sync: false
+      - key: MONARCH_PATH_SECRET
+        sync: false

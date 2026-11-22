@@ -1,0 +1,55 @@
+{
+	admin off
+	auto_https off
+}
+
+# Header-capable clients send the bearer token; claude.ai / mobile connectors
+# can't, so the same server is also reachable via a secret path prefix.
+# 404 rather than 401: a 401 makes MCP clients start OAuth discovery.
+(gated) {
+	@authorized header Authorization "Bearer {args[1]}"
+
+	handle @authorized {
+		reverse_proxy 127.0.0.1:{args[0]} {
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	handle_path /{args[2]}/* {
+		reverse_proxy 127.0.0.1:{args[0]} {
+			flush_interval -1
+			transport http {
+				read_timeout 0
+				write_timeout 0
+			}
+		}
+	}
+
+	handle {
+		respond 404
+	}
+}
+
+:{$PORT} {
+	handle /healthz {
+		respond "ok" 200
+	}
+
+	@whatsapp host {$WHATSAPP_HOST}
+	handle @whatsapp {
+		import gated 8765 {$WHATSAPP_BEARER_TOKEN} {$WHATSAPP_PATH_SECRET}
+	}
+
+	@monarch host {$MONARCH_HOST}
+	handle @monarch {
+		import gated 8767 {$MONARCH_BEARER_TOKEN} {$MONARCH_PATH_SECRET}
+	}
+
+	handle {
+		respond 404
+	}
+}

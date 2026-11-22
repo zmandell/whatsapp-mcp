@@ -1,0 +1,13 @@
+.git
+deploy
+render/README*
+example-use.png
+*.db
+*.db.bak*
+*.token
+*.secret
+whatsapp-bridge/store
+whatsapp-bridge/whatsapp-client
+whatsapp-mcp-server/.venv
+whatsapp-mcp-server/__pycache__
+**/__pycache__
