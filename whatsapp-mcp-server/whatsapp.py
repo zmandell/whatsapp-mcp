@@ -168,6 +168,41 @@ def _name_matched_jids(query: str) -> set:
         return set()
 
 
+def _contacts_matching(query: str) -> list:
+    """Saved contacts whose name or number matches, as (jid, phone_number, name, all_jids).
+
+    The JID is the phone-number form when we know it, since that is what
+    send_message accepts. all_jids holds every form of the contact, so callers
+    can tell when a chat for them already exists.
+    """
+    pattern = f"%{query}%"
+    try:
+        with closing(_wa_connect()) as conn:
+            rows = conn.execute(
+                "SELECT their_jid, full_name, first_name, push_name, business_name "
+                "FROM whatsmeow_contacts WHERE "
+                "LOWER(full_name) LIKE LOWER(?) OR LOWER(first_name) LIKE LOWER(?) OR "
+                "LOWER(push_name) LIKE LOWER(?) OR LOWER(business_name) LIKE LOWER(?) OR "
+                "their_jid LIKE ? LIMIT 200",
+                (pattern, pattern, pattern, pattern, pattern),
+            ).fetchall()
+            found = []
+            for their_jid, full, first, push, business in rows:
+                name = _best_name([(full, first, push, business)])
+                if not name:
+                    continue
+                user = _user_part(their_jid)
+                jid, phone = their_jid, user
+                if their_jid.endswith('@lid'):
+                    row = conn.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (user,)).fetchone()
+                    if row:
+                        jid, phone = f"{row[0]}@s.whatsapp.net", row[0]
+                found.append((jid, phone, name, _counterpart_jids(conn, user) | {their_jid}))
+            return found
+    except sqlite3.Error:
+        return []
+
+
 def get_sender_name(sender_jid: str) -> str:
     named = lookup_contact_name(sender_jid)
     if named:
@@ -588,6 +623,19 @@ def search_contacts(query: str) -> List[Contact]:
             )
             result.append(contact)
             
+        # Saved contacts you have no chat with (for example people who only appear in
+        # groups) are returned too, with a phone-number JID that send_message accepts.
+        chat_jids = {c.jid for c in result}
+        listed = set(chat_jids)
+        extra = []
+        for jid, phone, name, all_jids in _contacts_matching(query):
+            if all_jids & chat_jids or jid in listed:
+                continue
+            listed.add(jid)
+            extra.append(Contact(phone_number=phone, name=name, jid=jid))
+        extra.sort(key=lambda c: (c.name or "").lower())
+        result.extend(extra[:max(0, 50 - len(result))])
+
         return result
         
     except sqlite3.Error as e:

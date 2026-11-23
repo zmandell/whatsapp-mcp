@@ -162,6 +162,67 @@ class NameLookupTests(unittest.TestCase):
         self.assertEqual(chat.last_sender, "Alice Smith")
         self.assertEqual(chat.name, "Dev Group")
 
+    def test_search_returns_saved_contacts_who_have_no_chat(self):
+        folder = build_dbs(
+            contacts=[
+                ("15550004@s.whatsapp.net", "", "Dana Group-Only", "", ""),
+                ("888@lid", "", "Erin Lid-Only", "", ""),
+                ("999@lid", "", "Frank No-Map", "", ""),
+                ("15550006@s.whatsapp.net", "", "", "", ""),
+            ],
+            lid_map=[("888", "15550005")],
+            chats=[],
+        )
+        self.use(folder)
+        found = whatsapp.search_contacts("dana")
+        self.assertEqual([(c.jid, c.phone_number, c.name) for c in found],
+                         [("15550004@s.whatsapp.net", "15550004", "Dana Group-Only")])
+        # a LID-keyed contact comes back under the phone number send_message accepts
+        found = whatsapp.search_contacts("erin")
+        self.assertEqual([(c.jid, c.phone_number) for c in found], [("15550005@s.whatsapp.net", "15550005")])
+        # with no phone number known, the LID itself is all there is
+        found = whatsapp.search_contacts("frank")
+        self.assertEqual([(c.jid, c.phone_number) for c in found], [("999@lid", "999")])
+        # searching by number works, and a contact with no name at all is skipped
+        self.assertEqual([c.name for c in whatsapp.search_contacts("1555000")], ["Dana Group-Only"])
+        self.assertEqual(len([c for c in whatsapp.search_contacts("15550006")]), 0)
+
+    def test_a_contact_with_a_chat_is_listed_once(self):
+        folder = build_dbs(
+            contacts=[
+                ("15550001@s.whatsapp.net", "", "Alice Smith", "", ""),
+                ("777@lid", "", "Alice Smith", "", ""),
+            ],
+            lid_map=[("777", "15550001")],
+            chats=[("777@lid", "777", None)],
+        )
+        self.use(folder)
+        found = whatsapp.search_contacts("alice")
+        self.assertEqual([(c.jid, c.name) for c in found], [("777@lid", "Alice Smith")])
+
+    def test_a_person_saved_under_both_forms_is_listed_once(self):
+        folder = build_dbs(
+            contacts=[
+                ("15550007@s.whatsapp.net", "", "Gina Both", "", ""),
+                ("555@lid", "", "Gina Both", "", ""),
+            ],
+            lid_map=[("555", "15550007")],
+            chats=[],
+        )
+        self.use(folder)
+        found = whatsapp.search_contacts("gina")
+        self.assertEqual([c.jid for c in found], ["15550007@s.whatsapp.net"])
+
+    def test_results_are_capped_at_fifty_with_chats_first(self):
+        contacts = [(f"1555{i:04d}@s.whatsapp.net", "", f"Person {i:03d}", "", "") for i in range(120)]
+        folder = build_dbs(contacts=contacts, lid_map=[], chats=[("1555aaaa@s.whatsapp.net", "Person Chat First", None)])
+        self.use(folder)
+        found = whatsapp.search_contacts("person")
+        self.assertEqual(len(found), 50)
+        self.assertEqual(found[0].jid, "1555aaaa@s.whatsapp.net")
+        names = [c.name for c in found[1:]]
+        self.assertEqual(names, sorted(names, key=str.lower))
+
 
 if __name__ == "__main__":
     unittest.main()
