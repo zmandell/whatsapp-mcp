@@ -11,3 +11,4 @@ whatsapp-bridge/whatsapp-client
 whatsapp-mcp-server/.venv
 whatsapp-mcp-server/__pycache__
 **/__pycache__
+whatsapp-mcp-server/test_*.py

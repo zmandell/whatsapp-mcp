@@ -28,8 +28,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Python syntax
-        run: python -m compileall -q whatsapp-mcp-server/*.py
+      - name: Python syntax and tests
+        run: |
+          python -m compileall -q whatsapp-mcp-server/*.py
+          pip install requests
+          python -m unittest discover -s whatsapp-mcp-server -p "test_*.py"
 
       - name: Build the deploy image
         run: docker build -f render/Dockerfile -t mcp-hub:ci .

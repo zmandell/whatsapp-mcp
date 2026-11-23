@@ -1,4 +1,6 @@
 import sqlite3
+import time
+from contextlib import closing
 from datetime import datetime
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
@@ -8,6 +10,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(MESSAGES_DB_PATH), 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 BRIDGE_HEADERS = {"Authorization": f"Bearer {os.environ.get('BRIDGE_API_TOKEN', '')}"}
 
@@ -48,7 +51,127 @@ class MessageContext:
     before: List[Message]
     after: List[Message]
 
+_NAME_CACHE_SECONDS = 600
+_name_cache: dict = {}
+
+
+def _wa_connect():
+    """Read-only connection to whatsmeow's own store, which holds contact names."""
+    return sqlite3.connect(f"file:{WHATSAPP_DB_PATH}?mode=ro", uri=True, timeout=1)
+
+
+def _user_part(jid: str) -> str:
+    return jid.split('@')[0].split(':')[0]
+
+
+def _best_name(rows) -> Optional[str]:
+    """Pick one name from (full_name, first_name, push_name, business_name) rows.
+
+    Saved address-book names win. A name someone chose for themselves is marked
+    with '~', the way WhatsApp's own app marks it.
+    """
+    for column in (0, 1):
+        for row in rows:
+            if row[column]:
+                return row[column]
+    for row in rows:
+        if row[2]:
+            return "~" + row[2]
+    for row in rows:
+        if row[3]:
+            return row[3]
+    return None
+
+
+def _counterpart_jids(conn, user: str) -> set:
+    """A user's phone-number and LID forms, since contacts may be keyed by either."""
+    jids = {f"{user}@s.whatsapp.net", f"{user}@lid"}
+    for (pn,) in conn.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (user,)):
+        jids.add(f"{pn}@s.whatsapp.net")
+    for (lid,) in conn.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (user,)):
+        jids.add(f"{lid}@lid")
+    return jids
+
+
+def lookup_contact_name(sender: str) -> Optional[str]:
+    """Human name for a WhatsApp user (a phone number, LID or JID), or None."""
+    user = _user_part(sender or "")
+    if not user:
+        return None
+    cached = _name_cache.get(user)
+    if cached and time.time() - cached[0] < _NAME_CACHE_SECONDS:
+        return cached[1]
+    try:
+        with closing(_wa_connect()) as conn:
+            jids = sorted(_counterpart_jids(conn, user))
+            marks = ",".join("?" * len(jids))
+            rows = conn.execute(
+                "SELECT full_name, first_name, push_name, business_name "
+                f"FROM whatsmeow_contacts WHERE their_jid IN ({marks})",
+                jids,
+            ).fetchall()
+    except sqlite3.Error:
+        return None
+    name = _best_name(rows)
+    _name_cache[user] = (time.time(), name)
+    return name
+
+
+def _is_unnamed(jid: str, name: Optional[str]) -> bool:
+    return not name or name == _user_part(jid) or name.lstrip('+').isdigit()
+
+
+def resolve_chat_name(jid: str, name: Optional[str]) -> Optional[str]:
+    """The chat's stored name, replaced by a contact name when it is only a number."""
+    if jid.endswith('@g.us') or not _is_unnamed(jid, name):
+        return name
+    return lookup_contact_name(jid) or name
+
+
+def display_sender(sender: Optional[str]) -> Optional[str]:
+    """A sender shown by name when we know it, otherwise as stored."""
+    if not sender:
+        return sender
+    return lookup_contact_name(sender) or sender
+
+
+def phone_for_jid(jid: str) -> str:
+    """The phone number behind a JID; for an anonymized LID, look the number up."""
+    user = _user_part(jid)
+    if not jid.endswith('@lid'):
+        return user
+    try:
+        with closing(_wa_connect()) as conn:
+            row = conn.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (user,)).fetchone()
+    except sqlite3.Error:
+        return user
+    return row[0] if row else user
+
+
+def _name_matched_jids(query: str) -> set:
+    """JIDs, in both phone and LID form, of contacts whose name contains the query."""
+    pattern = f"%{query}%"
+    try:
+        with closing(_wa_connect()) as conn:
+            rows = conn.execute(
+                "SELECT their_jid FROM whatsmeow_contacts WHERE "
+                "LOWER(full_name) LIKE LOWER(?) OR LOWER(first_name) LIKE LOWER(?) OR "
+                "LOWER(push_name) LIKE LOWER(?) OR LOWER(business_name) LIKE LOWER(?) LIMIT 200",
+                (pattern, pattern, pattern, pattern),
+            ).fetchall()
+            jids: set = set()
+            for (their_jid,) in rows:
+                jids.add(their_jid)
+                jids |= _counterpart_jids(conn, _user_part(their_jid))
+            return jids
+    except sqlite3.Error:
+        return set()
+
+
 def get_sender_name(sender_jid: str) -> str:
+    named = lookup_contact_name(sender_jid)
+    if named:
+        return named
     try:
         conn = sqlite3.connect(MESSAGES_DB_PATH)
         cursor = conn.cursor()
@@ -74,7 +197,7 @@ def get_sender_name(sender_jid: str) -> str:
             cursor.execute("""
                 SELECT name
                 FROM chats
-                WHERE jid LIKE ?
+                WHERE jid LIKE ? AND jid NOT LIKE '%@g.us'
                 LIMIT 1
             """, (f"%{phone_part}%",))
             
@@ -379,8 +502,13 @@ def list_chats(
         params = []
         
         if query:
-            where_clauses.append("(LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?)")
+            by_contact = sorted(_name_matched_jids(query))
+            clause = "LOWER(chats.name) LIKE LOWER(?) OR chats.jid LIKE ?"
             params.extend([f"%{query}%", f"%{query}%"])
+            if by_contact:
+                clause += f" OR chats.jid IN ({','.join('?' * len(by_contact))})"
+                params.extend(by_contact)
+            where_clauses.append(f"({clause})")
             
         if where_clauses:
             query_parts.append("WHERE " + " AND ".join(where_clauses))
@@ -401,10 +529,10 @@ def list_chats(
         for chat_data in chats:
             chat = Chat(
                 jid=chat_data[0],
-                name=chat_data[1],
+                name=resolve_chat_name(chat_data[0], chat_data[1]),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
-                last_sender=chat_data[4],
+                last_sender=display_sender(chat_data[4]),
                 last_is_from_me=chat_data[5]
             )
             result.append(chat)
@@ -428,25 +556,34 @@ def search_contacts(query: str) -> List[Contact]:
         # Split query into characters to support partial matching
         search_pattern = '%' +query + '%'
         
-        cursor.execute("""
-            SELECT DISTINCT 
+        # Contacts are also matched by the names in whatsmeow's contact store, so a
+        # chat that is only stored under a number can still be found by name.
+        by_contact = sorted(_name_matched_jids(query))
+        match = "LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?)"
+        params = [search_pattern, search_pattern]
+        if by_contact:
+            match += f" OR jid IN ({','.join('?' * len(by_contact))})"
+            params.extend(by_contact)
+
+        cursor.execute(f"""
+            SELECT DISTINCT
                 jid,
                 name
             FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
+            WHERE
+                ({match})
                 AND jid NOT LIKE '%@g.us'
             ORDER BY name, jid
             LIMIT 50
-        """, (search_pattern, search_pattern))
-        
+        """, params)
+
         contacts = cursor.fetchall()
-        
+
         result = []
         for contact_data in contacts:
             contact = Contact(
-                phone_number=contact_data[0].split('@')[0],
-                name=contact_data[1],
+                phone_number=phone_for_jid(contact_data[0]),
+                name=resolve_chat_name(contact_data[0], contact_data[1]),
                 jid=contact_data[0]
             )
             result.append(contact)
@@ -494,10 +631,10 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
         for chat_data in chats:
             chat = Chat(
                 jid=chat_data[0],
-                name=chat_data[1],
+                name=resolve_chat_name(chat_data[0], chat_data[1]),
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
-                last_sender=chat_data[4],
+                last_sender=display_sender(chat_data[4]),
                 last_is_from_me=chat_data[5]
             )
             result.append(chat)
@@ -594,10 +731,10 @@ def get_chat(chat_jid: str, include_last_message: bool = True) -> Optional[Chat]
             
         return Chat(
             jid=chat_data[0],
-            name=chat_data[1],
+            name=resolve_chat_name(chat_data[0], chat_data[1]),
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
-            last_sender=chat_data[4],
+            last_sender=display_sender(chat_data[4]),
             last_is_from_me=chat_data[5]
         )
         
@@ -637,10 +774,10 @@ def get_direct_chat_by_contact(sender_phone_number: str) -> Optional[Chat]:
             
         return Chat(
             jid=chat_data[0],
-            name=chat_data[1],
+            name=resolve_chat_name(chat_data[0], chat_data[1]),
             last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
             last_message=chat_data[3],
-            last_sender=chat_data[4],
+            last_sender=display_sender(chat_data[4]),
             last_is_from_me=chat_data[5]
         )
         
