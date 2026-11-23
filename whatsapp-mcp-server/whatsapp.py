@@ -92,6 +92,30 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
+def get_reactions_text(chat_jid: str, message_id: str) -> str:
+    """Reactions on a message as one line, e.g. '👍 Alice, Bob; ❤️ Me'. Empty if none."""
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT emoji, sender, is_from_me FROM reactions "
+            "WHERE chat_jid = ? AND message_id = ? ORDER BY timestamp",
+            (chat_jid, message_id),
+        )
+        rows = cursor.fetchall()
+    except sqlite3.Error:
+        # A database from before reactions were captured has no such table yet.
+        return ""
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+    names_by_emoji: dict = {}
+    for emoji, sender, is_from_me in rows:
+        name = "Me" if is_from_me else get_sender_name(sender)
+        names_by_emoji.setdefault(emoji, []).append(name)
+    return "; ".join(f"{emoji} {', '.join(names)}" for emoji, names in names_by_emoji.items())
+
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
@@ -110,6 +134,10 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
     except Exception as e:
         print(f"Error formatting message: {e}")
+
+    reactions = get_reactions_text(message.chat_jid, message.id)
+    if reactions:
+        output += f"    Reactions: {reactions}\n"
     return output
 
 def format_messages_list(messages: List[Message], show_chat_info: bool = True) -> None:

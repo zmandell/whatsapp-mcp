@@ -85,6 +85,16 @@ func NewMessageStore() (*MessageStore, error) {
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
+
+		CREATE TABLE IF NOT EXISTS reactions (
+			chat_jid TEXT,
+			message_id TEXT,
+			sender TEXT,
+			emoji TEXT,
+			timestamp TIMESTAMP,
+			is_from_me BOOLEAN,
+			PRIMARY KEY (chat_jid, message_id, sender)
+		);
 	`)
 	if err != nil {
 		db.Close()
@@ -104,6 +114,25 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
 		jid, name, lastMessageTime,
+	)
+	return err
+}
+
+// StoreReaction records one sender's reaction to a message. A sender has at most
+// one reaction per message, so a new emoji replaces the old one, and an empty
+// emoji is WhatsApp's way of removing it.
+func (store *MessageStore) StoreReaction(chatJID, messageID, sender, emoji string, timestamp time.Time, isFromMe bool) error {
+	if emoji == "" {
+		_, err := store.db.Exec(
+			"DELETE FROM reactions WHERE chat_jid = ? AND message_id = ? AND sender = ?",
+			chatJID, messageID, sender,
+		)
+		return err
+	}
+	_, err := store.db.Exec(
+		`INSERT OR REPLACE INTO reactions (chat_jid, message_id, sender, emoji, timestamp, is_from_me)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		chatJID, messageID, sender, emoji, timestamp, isFromMe,
 	)
 	return err
 }
@@ -473,6 +502,12 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 
 // Handle regular incoming messages with media support
 func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+	// A reaction is not a message of its own: it attaches to an earlier one.
+	if reaction := msg.Message.GetReactionMessage(); reaction != nil {
+		handleReaction(messageStore, msg, reaction, logger)
+		return
+	}
+
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
@@ -531,6 +566,26 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 	}
+}
+
+// handleReaction stores an incoming reaction, or removes it when the emoji is empty.
+func handleReaction(messageStore *MessageStore, msg *events.Message, reaction *waProto.ReactionMessage, logger waLog.Logger) {
+	targetID := reaction.GetKey().GetID()
+	if targetID == "" {
+		return
+	}
+	timestamp := msg.Info.Timestamp
+	if ms := reaction.GetSenderTimestampMS(); ms > 0 {
+		timestamp = time.UnixMilli(ms)
+	}
+	err := messageStore.StoreReaction(
+		msg.Info.Chat.String(), targetID, msg.Info.Sender.User, reaction.GetText(), timestamp, msg.Info.IsFromMe,
+	)
+	if err != nil {
+		logger.Warnf("Failed to store reaction: %v", err)
+		return
+	}
+	fmt.Printf("[%s] reaction %q from %s on %s\n", timestamp.Format("2006-01-02 15:04:05"), reaction.GetText(), msg.Info.Sender.User, targetID)
 }
 
 // DownloadMediaRequest represents the request body for the download media API
