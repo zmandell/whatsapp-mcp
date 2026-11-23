@@ -7,7 +7,7 @@ RUN CGO_ENABLED=1 go build -trimpath -o /out/whatsapp-bridge .
 
 FROM alpine:3 AS monarch-src
 ARG MONARCH_REPO=https://github.com/zmandell/monarch-mcp-server.git
-ARG MONARCH_REF=0733408daa76c85727c7c0caaaf6a04094725323
+ARG MONARCH_REF=d32bde5c9bd2a4b385dbf4646f3dda86268edb75
 RUN apk add --no-cache git \
     && git init /src \
     && git -C /src fetch --depth 1 "$MONARCH_REPO" "$MONARCH_REF" \

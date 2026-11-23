@@ -19,7 +19,7 @@ services:
       - key: MONARCH_HOST
         value: monarch.spoonur.com
       - key: MONARCH_MCP_READ_ONLY
-        value: "1"
+        value: "0"
       - key: WHATSAPP_BEARER_TOKEN
         sync: false
       - key: WHATSAPP_PATH_SECRET

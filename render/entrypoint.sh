@@ -69,6 +69,7 @@ supervise monarch-mcp env -i PATH="$PATH" HOME=/data/monarch-home PYTHONUNBUFFER
 	MONARCH_MCP_PORT=8767 \
 	MONARCH_MCP_ALLOWED_HOSTS="$MONARCH_HOST" \
 	MONARCH_MCP_READ_ONLY="${MONARCH_MCP_READ_ONLY:-1}" \
+	MONARCH_MCP_HIDE_SESSION_TOOLS="${MONARCH_MCP_HIDE_SESSION_TOOLS:-1}" \
 	/opt/monarch/.venv/bin/monarch-mcp-server
 
 supervise caddy env -i PATH="$PATH" HOME=/tmp \
