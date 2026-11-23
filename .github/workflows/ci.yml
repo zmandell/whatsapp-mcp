@@ -33,3 +33,18 @@ jobs:
 
       - name: Build the deploy image
         run: docker build -f render/Dockerfile -t mcp-hub:ci .
+
+  deploy:
+    needs: check
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ask Render to deploy this commit
+        env:
+          HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+        run: |
+          test -n "$HOOK" || { echo "RENDER_DEPLOY_HOOK is not set"; exit 1; }
+          case "$HOOK" in *\?*) sep='&' ;; *) sep='?' ;; esac
+          curl -fsS -X POST "${HOOK}${sep}ref=${GITHUB_SHA}"
+          echo
+          echo "Deploy requested for ${GITHUB_SHA}"
